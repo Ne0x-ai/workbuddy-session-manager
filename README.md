@@ -4,7 +4,7 @@
 
 <h1 align="center">WorkBuddy 会话管理</h1>
 
-<p align="center">查看、导出、清理你的 WorkBuddy 本地对话。</p>
+<p align="center">查看、导出、清理、迁移你的 WorkBuddy 本地对话。</p>
 
 ---
 
