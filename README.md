@@ -52,7 +52,7 @@ WorkBuddy 会在每条对话里塞一堆东西:系统提示、记忆摘要、当
 
 ## 下载
 
-去 [Releases](https://github.com/NeoXue-ai/workbuddy-session-manager/releases) 下载 `WorkBuddy-Session-Manager-macOS.zip`,解压后把 `WorkBuddy 会话管理.app` 拖进「应用程序」。
+去 [Releases](https://github.com/Ne0x-ai/workbuddy-session-manager/releases) 下载 `WorkBuddy-Session-Manager-macOS.zip`,解压后把 `WorkBuddy 会话管理.app` 拖进「应用程序」。
 
 需要 **macOS 14 或更新版本**。
 
@@ -96,7 +96,7 @@ WorkBuddy 会在每条对话里塞一堆东西:系统提示、记忆摘要、当
 ## 自己编译
 
 ```bash
-git clone https://github.com/NeoXue-ai/workbuddy-session-manager.git
+git clone https://github.com/Ne0x-ai/workbuddy-session-manager.git
 cd workbuddy-session-manager
 ./build-app.sh
 open "build/WorkBuddy 会话管理.app"
