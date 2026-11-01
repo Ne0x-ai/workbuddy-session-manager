@@ -5,13 +5,45 @@ import Foundation
 enum Headless {
     static func runIfRequested() -> Bool {
         let args = CommandLine.arguments
-        guard let mode = args.first(where: { $0 == "--selftest" || $0 == "--selftest-write" }) else {
+        guard let mode = args.first(where: {
+            $0 == "--selftest" || $0 == "--selftest-write" || $0 == "--selftest-disk-cleanup" || $0 == "--kill-workbuddy"
+        }) else {
             return false
         }
+        if mode == "--kill-workbuddy" { exit(killWorkBuddy()) }
+        if mode == "--selftest-disk-cleanup" { exit(selfTestDiskCleanup()) }
         let dir = ProcessInfo.processInfo.environment["WBSM_DATA_DIR"]
             .map { URL(fileURLWithPath: $0) }
             ?? Database.overseas
         exit(run(mode: mode, dataDir: dir))
+    }
+
+    private static func selfTestDiskCleanup() -> Int32 {
+        do {
+            print(try DiskCleanup.selfTest())
+            return 0
+        } catch {
+            print("失败：\(error.localizedDescription)")
+            return 1
+        }
+    }
+
+    /// 命令行版的「关闭 WorkBuddy」，与 GUI 里那个按钮同一套逻辑。
+    private static func killWorkBuddy() -> Int32 {
+        let before = WorkBuddyProcess.running()
+        print("检测到 \(before.count) 个 WorkBuddy 进程")
+        for match in before {
+            print("  \(match.pid)  \(match.command.prefix(90))")
+        }
+        let report = WorkBuddyTerminator.terminateAll()
+        print("已结束 \(report.terminated.count) 个，强杀 \(report.forced.count) 个")
+        guard report.remaining.isEmpty else {
+            print("✗ 残留 \(report.remaining.count) 个：")
+            for match in report.remaining { print("  \(match.pid)  \(match.command.prefix(90))") }
+            return 1
+        }
+        print("✓ 已清空")
+        return 0
     }
 
     private static func run(mode: String, dataDir: URL) -> Int32 {
@@ -56,16 +88,36 @@ enum Headless {
 
             print("—— 写测试 ——")
             print("迁移前    \(String(first.id.prefix(8))) 归属 \(accounts[0].shortUID)")
-            guard let backup = try db.migrate(sessionID: first.id, to: target.uid) else {
+            guard try db.migrate(sessionID: first.id, to: target.uid) else {
                 print("迁移      无变化"); return 0
             }
-            print("迁移后    归属 \(target.shortUID)  备份 \(backup.lastPathComponent)")
-            print("回收站    \(try db.moveToTrash(sessionID: first.id) != nil ? "已移入" : "无变化")")
-            print("还原      \(try db.restoreFromTrash(sessionID: first.id) != nil ? "已还原" : "无变化")")
+            print("迁移后    归属 \(target.shortUID)")
 
-            try? FileManager.default.removeItem(at: backup)
             _ = try db.migrate(sessionID: first.id, to: accounts[0].uid)
             print("复原      归属 \(accounts[0].shortUID)  已还原")
+            // 自检自己造的备份不留
+            try? FileManager.default.removeItem(at: db.dataDir.appendingPathComponent("backups"))
+
+            // 彻底删除不可逆，只在沙箱里试。真实库上删了用户就找不回来了。
+            if ProcessInfo.processInfo.environment["WBSM_DATA_DIR"] != nil {
+                let pool = try db.sessions(userID: accounts[0].uid, includeTrashed: false)
+                // 优先挑真有正文文件的那个，否则测不到"文件也被删了"
+                let victim = pool.first {
+                    $0.id != first.id
+                        && FileManager.default.fileExists(atPath: db.transcriptURL(for: $0).path)
+                } ?? pool.first { $0.id != first.id }
+                if let victim {
+                    let file = db.transcriptURL(for: victim)
+                    let hadFile = FileManager.default.fileExists(atPath: file.path)
+                    let freed = try db.hardDelete(sessionID: victim.id)
+                    let fileGone = !FileManager.default.fileExists(atPath: file.path)
+                    let recordGone = try !db.sessions(userID: accounts[0].uid, includeTrashed: false)
+                        .contains { $0.id == victim.id }
+                    print("彻底删除  释放 \(freed) 字节  原有文件=\(hadFile) 现已删=\(fileGone) 记录已清=\(recordGone)")
+                }
+            } else {
+                print("彻底删除  跳过（只在沙箱里测，真实库不碰）")
+            }
 
             let (uid, nickname) = db.currentAccount() ?? ("-", nil)
             print("当前登录  \(nickname ?? "未知") \(String(uid.prefix(8)))")

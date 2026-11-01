@@ -5,6 +5,9 @@ import Foundation
 @main
 enum Entry {
     static func main() {
+        // 工具栏提示默认要悬停半秒才出，慢得跟不上手。AppKit 读这个键决定首次延迟，
+        // 越早注册越保险。
+        UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 100])
         if Headless.runIfRequested() { return }
         WorkBuddySessionManagerApp.main()
     }

@@ -28,7 +28,7 @@ enum WBError: LocalizedError {
 
 /// 两个官方发行版各用独立的数据目录，账号、会话、库都不互通，
 /// 所以界面上必须让用户明确当前在看哪一个。
-enum DataSource: String, CaseIterable, Identifiable {
+enum DataSource: String, CaseIterable, Identifiable, Hashable, Sendable {
     case overseas
     case domestic
 
@@ -158,11 +158,13 @@ final class Database {
     }
 
     func sessions(userID: String, includeTrashed: Bool) throws -> [WorkSession] {
+        // deleted_at 有三态：NULL 未删、正数 已删、-1 云端会话的哨兵值。
+        // 回收站只认正数，-1 既不是已删也不是未删，两边都不归它。
         let sql = """
             SELECT id, user_id, COALESCE(title,''), cwd, transport,
                    created_at, updated_at, deleted_at
             FROM sessions
-            WHERE user_id = ?1 \(includeTrashed ? "" : "AND deleted_at IS NULL")
+            WHERE user_id = ?1 AND \(includeTrashed ? "deleted_at > 0" : "deleted_at IS NULL")
             ORDER BY updated_at DESC
             """
         let stmt = try prepare(sql)
@@ -220,32 +222,15 @@ final class Database {
     // MARK: - 写操作
 
     /// 返回运行中的 WorkBuddy 进程 pid；空数组表示已退出。
+    /// sidecar 与网关也算——它们同样持有数据目录里的文件。
     static func runningProcessIDs() -> [String] {
-        var found: [String] = []
-        for pattern in ["WorkBuddy AI.app", "WorkBuddy.app"] {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-            process.arguments = ["-f", pattern]
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = Pipe()
-            do {
-                try process.run()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                let text = String(decoding: data, as: UTF8.self)
-                found += text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-            } catch {
-                continue
-            }
-        }
-        return Array(Set(found)).sorted()
+        WorkBuddyProcess.running().map { String($0.pid) }.sorted()
     }
 
     /// 用 SQLite backup API 生成一致性副本，避免裸拷贝遇到半截 WAL。
     @discardableResult
     func makeBackup() throws -> URL {
-        let dest = Self.uniqueBackupURL(near: dataDir.deletingLastPathComponent())
+        let dest = try Self.backupURL(in: dataDir)
         var destDB: OpaquePointer?
         guard sqlite3_open_v2(dest.path, &destDB, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK, let destDB else {
             throw WBError.writeFailed("无法创建备份文件")
@@ -292,15 +277,17 @@ final class Database {
             try? FileManager.default.removeItem(at: dest)
             throw WBError.writeFailed("备份完整性校验未通过（\(verdict)）")
         }
+        Self.pruneBackups(in: dataDir)
         return dest
     }
 
-    /// 改归属。幂等：已在目标账号下会直接返回 nil。
+    /// 改归属。这是唯一不可逆的写操作——原归属写成功后就没处查了，所以留一份备份。
+    /// - Returns: 是否真的发生了迁移
     @discardableResult
-    func migrate(sessionID: String, to targetUID: String) throws -> URL? {
+    func migrate(sessionID: String, to targetUID: String) throws -> Bool {
         try assertWritable()
         guard let current = try accountOf(sessionID) else { throw WBError.notFound("未找到会话 \(sessionID)") }
-        if current.userID == targetUID { return nil }
+        if current.userID == targetUID { return false }
 
         let backup = try makeBackup()
         try execute("UPDATE sessions SET user_id = ?1 WHERE id = ?2", [targetUID, sessionID])
@@ -309,31 +296,70 @@ final class Database {
             try execute("UPDATE sessions SET user_id = ?1 WHERE id = ?2", [current.userID, sessionID])
             throw WBError.writeFailed("写入后校验失败，已自动回滚")
         }
-        return backup
+        return true
     }
 
-    /// 移入回收站：只写 deleted_at，正文与工作目录不动，随时可还原。
+    /// 彻底删除：正文文件和索引记录一起清掉，磁盘空间立刻回来。
+    ///
+    /// 不做软删除——标个 deleted_at 的话正文还占着磁盘，这个工具就白做了。
+    /// 不可恢复，所以调用方必须先跟用户确认。
+    /// - Returns: 释放的字节数
     @discardableResult
-    func moveToTrash(sessionID: String) throws -> URL? {
+    func hardDelete(sessionID: String) throws -> Int {
         try assertWritable()
         guard let current = try accountOf(sessionID) else { throw WBError.notFound("未找到会话 \(sessionID)") }
-        if current.deletedAt != nil { return nil }
+        let fm = FileManager.default
+        let file = transcriptURL(for: current)
 
-        let backup = try makeBackup()
-        try execute("UPDATE sessions SET deleted_at = ?1 WHERE id = ?2",
-                    [Self.millisFromNow, sessionID])
-        return backup
+        let attrs: [FileAttributeKey: Any]?
+        do {
+            attrs = try fm.attributesOfItem(atPath: file.path)
+        } catch {
+            let nsError = error as NSError
+            guard nsError.domain == NSCocoaErrorDomain,
+                  nsError.code == CocoaError.Code.fileReadNoSuchFile.rawValue else {
+                throw error
+            }
+            attrs = nil
+        }
+        let freed = (attrs?[.size] as? Int) ?? 0
+
+        try execute("BEGIN IMMEDIATE", [])
+        do {
+            try execute("DELETE FROM session_usage WHERE session_id = ?1", [sessionID])
+            try execute("DELETE FROM sessions WHERE id = ?1", [sessionID])
+            if attrs != nil { try fm.removeItem(at: file) }
+            try execute("COMMIT", [])
+        } catch {
+            try? execute("ROLLBACK", [])
+            throw error
+        }
+
+        let folder = file.deletingLastPathComponent()
+        if (try? fm.contentsOfDirectory(atPath: folder.path))?.isEmpty == true {
+            try? fm.removeItem(at: folder)
+        }
+        return freed
     }
 
+    /// 正文占多大。删之前先告诉用户能省多少。
+    func transcriptSize(for session: WorkSession) -> Int {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: transcriptURL(for: session).path)
+        return (attrs?[.size] as? Int) ?? 0
+    }
+
+    /// 从回收站还原：只把 deleted_at 抹掉，正文本来就没动过。
     @discardableResult
-    func restoreFromTrash(sessionID: String) throws -> URL? {
+    func restoreFromTrash(sessionID: String) throws -> Bool {
         try assertWritable()
         guard let current = try accountOf(sessionID) else { throw WBError.notFound("未找到会话 \(sessionID)") }
-        if current.deletedAt == nil { return nil }
+        // deleted_at = -1 是云端会话的哨兵值，会被解成 1969 年，不是「删过」的语义
+        guard let deletedAt = current.deletedAt, deletedAt.timeIntervalSince1970 > 1_600_000_000 else {
+            return false
+        }
 
-        let backup = try makeBackup()
         try execute("UPDATE sessions SET deleted_at = NULL WHERE id = ?1", [sessionID])
-        return backup
+        return true
     }
 
     /// 守卫只保护正在被应用使用的真实数据目录。经 WBSM_DATA_DIR 指向的副本
@@ -392,7 +418,10 @@ final class Database {
     }
 
     /// 连续几次写操作可能落在同一秒内，靠秒级时间戳会互相覆盖备份。
-    private static func uniqueBackupURL(near dir: URL) -> URL {
+    /// 备份统一放数据目录下的 backups/，不再往家目录里撒文件。
+    private static func backupURL(in dataDir: URL) throws -> URL {
+        let dir = dataDir.appendingPathComponent("backups")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let stamp = filenameTimestamp()
         var candidate = dir.appendingPathComponent("workbuddy.db.bak-\(stamp)")
         var suffix = 1
@@ -401,6 +430,20 @@ final class Database {
             suffix += 1
         }
         return candidate
+    }
+
+    /// 只留最近几份。备份是用来兜底的，不是用来攒的。
+    private static func pruneBackups(in dataDir: URL, keeping limit: Int = 5) {
+        let fm = FileManager.default
+        let dir = dataDir.appendingPathComponent("backups")
+        guard let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
+        // 文件名里的时间戳定长，字典序即时间序
+        let backups = items
+            .filter { $0.lastPathComponent.hasPrefix("workbuddy.db.bak-") }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        for stale in backups.dropLast(limit) {
+            try? fm.removeItem(at: stale)
+        }
     }
 }
 

@@ -3,7 +3,7 @@ import AppKit
 
 struct ContentView: View {
     @StateObject private var state = AppState()
-    @State private var showingMigrate = false
+    @State private var activeSheet: ActiveSheet?
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
@@ -11,17 +11,39 @@ struct ContentView: View {
             AccountSidebar(state: state)
                 .navigationSplitViewColumnWidth(min: 216, ideal: 248)
         } content: {
-            SessionList(state: state, showingMigrate: $showingMigrate)
+            SessionList(state: state)
                 .navigationSplitViewColumnWidth(min: 260, ideal: 300)
         } detail: {
             SessionDetail(state: state)
         }
         .toolbar { toolbarContent }
-        .sheet(isPresented: $showingMigrate) {
-            MigrateSheet(state: state, session: state.selectedSession)
+        .sheet(item: $activeSheet) { sheet in
+            switch sheet {
+            case .migrate:
+                MigrateSheet(state: state, session: state.selectedSession)
+            case .diskCleanup:
+                DiskCleanupSheet(state: state)
+            }
         }
         .alert(item: $state.alert) { alert in
             Alert(title: Text(alert.title), message: Text(alert.message), dismissButton: .default(Text("好")))
+        }
+        .confirmationDialog(
+            "永久删除「\(state.pendingDeletion?.session.displayTitle ?? "")」？",
+            isPresented: Binding(
+                get: { state.pendingDeletion != nil },
+                set: { if !$0 { state.pendingDeletion = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("永久删除", role: .destructive) { state.confirmPermanentDelete() }
+            Button("取消", role: .cancel) { state.pendingDeletion = nil }
+        } message: {
+            if let pending = state.pendingDeletion {
+                Text(pending.size > 0
+                     ? "正文 \(AppState.formatBytes(pending.size)) 会一起删掉，删了就没了，找不回来。"
+                     : "这条记录会从索引里删掉，找不回来。")
+            }
         }
         .task { state.bootstrap() }
         .frame(minWidth: 940, minHeight: 560)
@@ -34,27 +56,46 @@ struct ContentView: View {
                 Label("显示回收站", systemImage: "trash")
             }
             .toggleStyle(.button)
-            .help("回收站中的会话默认不显示")
+            .hoverTip("回收站中的会话默认不显示")
         }
         ToolbarItemGroup(placement: .primaryAction) {
             if state.isBusy { ProgressView().controlSize(.small) }
 
-            Button { showingMigrate = true } label: { Label("迁移", systemImage: "arrow.left.arrow.right") }
+            Button { state.killWorkBuddyProcesses() } label: {
+                if state.isKilling {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Label("关闭 WorkBuddy", systemImage: "power")
+                }
+            }
+            .disabled(state.isKilling)
+            .hoverTip("结束 WorkBuddy 及其后台进程")
+
+            Button { activeSheet = .migrate } label: { Label("迁移", systemImage: "arrow.left.arrow.right") }
                 .disabled(state.selectedSession == nil)
-                .help("把该会话的归属改到另一个账号")
+                .hoverTip("把该会话的归属改到另一个账号")
 
             Button { exportSelected() } label: { Label("导出", systemImage: "square.and.arrow.up") }
                 .disabled(state.selectedSession == nil)
-                .help("导出为 markdown")
+                .hoverTip("导出为 markdown")
 
             if state.selectedSession?.isTrashed == true {
                 Button { state.restore() } label: { Label("还原", systemImage: "arrow.uturn.backward") }
-                    .help("从回收站还原")
-            } else {
-                Button { state.moveToTrash() } label: { Label("删除", systemImage: "trash") }
+                    .hoverTip("从回收站还原")
+                Button { state.requestPermanentDelete() } label: { Label("彻底删除", systemImage: "trash.slash") }
                     .disabled(state.selectedSession == nil)
-                    .help("移入回收站，正文不会删除，可随时还原")
+                    .hoverTip("删掉正文，释放磁盘空间")
+            } else {
+                Button { state.requestPermanentDelete() } label: { Label("删除", systemImage: "trash") }
+                    .disabled(state.selectedSession == nil)
+                    .hoverTip("删掉正文，释放磁盘空间")
             }
+        }
+        ToolbarItem(placement: .primaryAction) {
+            Button { activeSheet = .diskCleanup } label: {
+                Label("磁盘清理", systemImage: "externaldrive.badge.timemachine")
+            }
+            .hoverTip("清理旧日志、追踪和缓存")
         }
     }
 
@@ -145,7 +186,7 @@ private struct SourceSwitcher: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .controlSize(.small)
-            .help("两个发行版各用一套账号与会话库，互不相通")
+            .hoverTip("两个发行版各用一套账号与会话库，互不相通")
         }
         .padding(.horizontal, 10)
         .padding(.top, 8)
@@ -185,7 +226,6 @@ private struct AccountRow: View {
 
 private struct SessionList: View {
     @ObservedObject var state: AppState
-    @Binding var showingMigrate: Bool
 
     var body: some View {
         List(selection: $state.selectedSessionID) {
@@ -334,6 +374,183 @@ private struct TurnView: View {
             }
             if !isUser { Spacer(minLength: 64) }
         }
+    }
+}
+
+private enum ActiveSheet: String, Identifiable {
+    case migrate
+    case diskCleanup
+
+    var id: String { rawValue }
+}
+
+// MARK: - 磁盘清理
+
+private struct DiskCleanupSheet: View {
+    @ObservedObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @State private var retentionDays = 7
+    @State private var selectedCategories: Set<DiskCleanupCategory> = [.logs, .sandboxLogs, .traces]
+    @State private var showingConfirmation = false
+
+    private var preview: DiskCleanupPreview? { state.diskCleanupPreview }
+    private var selectedFiles: Int {
+        preview?.files.filter { selectedCategories.contains($0.category) }.count ?? 0
+    }
+    private var selectedBytes: Int {
+        preview?.files.filter { selectedCategories.contains($0.category) }.reduce(0) { $0 + $1.size } ?? 0
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("磁盘清理").font(.title2).fontWeight(.semibold)
+                    Text("仅处理当前数据源：\(state.source.appName) · 版本 \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "未知")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("关闭") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(state.isCleaningDisk)
+            }
+
+            Text("删除超过所选期限的日志、追踪和缓存文件。会话正文、工作区、运行文件及数据库不会改动。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Text("保留最近")
+                Picker("保留期限", selection: $retentionDays) {
+                    ForEach(DiskCleanup.retentionOptions, id: \.self) { days in
+                        Text("\(days) 天").tag(days)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 110)
+                .disabled(state.isScanningDisk || state.isCleaningDisk)
+                .onChange(of: retentionDays) { _, value in state.scanDiskCleanup(retentionDays: value) }
+                Spacer()
+                Button("重新扫描") { state.scanDiskCleanup(retentionDays: retentionDays) }
+                    .disabled(state.isScanningDisk || state.isCleaningDisk)
+            }
+
+            if state.isScanningDisk {
+                ProgressView("正在统计可清理文件…")
+                    .frame(maxWidth: .infinity, minHeight: 155)
+            } else if let preview {
+                VStack(spacing: 0) {
+                    ForEach(preview.summaries) { item in
+                        categoryRow(item)
+                        if item.id != preview.summaries.last?.id { Divider() }
+                    }
+                    Divider()
+                    HStack {
+                        Text("已选 \(selectedFiles) 个文件")
+                        Spacer()
+                        Text(AppState.formatBytes(selectedBytes)).fontWeight(.semibold)
+                    }
+                    .font(.callout)
+                    .padding(.vertical, 10)
+                }
+                .padding(.horizontal, 12)
+                .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+            } else {
+                ContentUnavailableView(
+                    "尚未扫描",
+                    systemImage: "externaldrive",
+                    description: Text(state.diskCleanupError ?? "扫描前会确认 WorkBuddy 已完全退出。")
+                )
+                .frame(maxWidth: .infinity, minHeight: 160)
+            }
+
+            if state.isCleaningDisk {
+                ProgressView("正在逐项复核并清理…")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if let error = state.diskCleanupError, preview != nil {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let result = state.diskCleanupResult {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("清理完成：删除 \(result.deletedFiles) 个文件，释放 \(AppState.formatBytes(result.freedBytes))。")
+                    if result.skippedChangedFiles > 0 {
+                        Text("\(result.skippedChangedFiles) 个扫描后有变化的文件已跳过。")
+                    }
+                    if let stopReason = result.stopReason { Text(stopReason) }
+                    ForEach(result.failures, id: \.self) { failure in Text(failure) }
+                }
+                .font(.caption)
+                .foregroundColor(result.failures.isEmpty ? .secondary : .orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Text("清理前必须先退出 WorkBuddy。清理进行期间请勿重新打开它。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(state.isCleaningDisk)
+                Button("清理所选文件…") { showingConfirmation = true }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(preview == nil || selectedCategories.isEmpty || selectedFiles == 0
+                              || state.isScanningDisk || state.isCleaningDisk)
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
+        .confirmationDialog(
+            "永久删除所选的 \(selectedFiles) 个文件？",
+            isPresented: $showingConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("永久删除", role: .destructive) {
+                state.cleanDisk(categories: selectedCategories)
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("预计释放 \(AppState.formatBytes(selectedBytes))。日志、追踪和缓存会被永久删除，无法恢复。")
+        }
+        .onAppear { state.scanDiskCleanup(retentionDays: retentionDays) }
+        .onChange(of: state.source) { _, _ in state.scanDiskCleanup(retentionDays: retentionDays) }
+        .onDisappear {
+            if !state.isCleaningDisk { state.cancelDiskCleanup() }
+        }
+        .interactiveDismissDisabled(state.isCleaningDisk)
+    }
+
+    private func categoryRow(_ item: DiskCleanupSummary) -> some View {
+        let selected = Binding(
+            get: { selectedCategories.contains(item.category) },
+            set: { value in
+                if value { selectedCategories.insert(item.category) }
+                else { selectedCategories.remove(item.category) }
+            }
+        )
+        return Toggle(isOn: selected) {
+            HStack(spacing: 10) {
+                Image(systemName: item.category.systemImage)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20)
+                Text(item.category.title)
+                Spacer()
+                Text("\(item.fileCount) 个 · \(AppState.formatBytes(item.bytes))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .toggleStyle(.checkbox)
+        .padding(.vertical, 9)
+        .disabled(state.isCleaningDisk || item.fileCount == 0)
     }
 }
 
